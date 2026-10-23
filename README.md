@@ -1,6 +1,6 @@
 # sloth-tidy
 
-![CI](https://github.com/YOUR-USER/sloth-tidy/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Hasalawa/sloth-tidy/actions/workflows/ci.yml/badge.svg)
 
 A lazy, local, undoable file tidier. A small open-weight model running in
 [Ollama](https://ollama.com) reads each file's name and a short snippet,
