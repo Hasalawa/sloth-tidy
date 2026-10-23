@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+messy/
+_demo/
+.sloth-tidy-log.json
+.venv/

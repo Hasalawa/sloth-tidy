@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Syntax check
+        run: python -m py_compile sloth_tidy.py make_mess.py
+      - name: Unit tests (fake Ollama server, no model needed)
+        run: python -m unittest -v
+      - name: Smoke test the CLI (dry run, rules only)
+        run: |
+          python make_mess.py ./messy
+          python sloth_tidy.py --no-ai tidy ./messy
+          python sloth_tidy.py --no-ai tidy ./messy --apply
+          python sloth_tidy.py undo ./messy
+          test -f "./messy/setup.exe"
