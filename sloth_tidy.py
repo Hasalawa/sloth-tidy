@@ -13,11 +13,16 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import secrets
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import webbrowser
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 LOG_NAME = ".sloth-tidy-log.json"
@@ -132,7 +137,7 @@ def unique(dst: Path, taken: set[Path]) -> Path:
 
 
 # ------------------------------------------------------------------- plan
-def plan(root: Path, host: str, model: str, use_ai: bool, min_age: float = 0.0) -> list[Move]:
+def plan(root: Path, host: str, model: str, use_ai: bool, min_age: float = 0.0, on_warn=None) -> list[Move]:
     moves: list[Move] = []
     taken: set[Path] = set()
     ai_alive = use_ai
@@ -151,7 +156,11 @@ def plan(root: Path, host: str, model: str, use_ai: bool, min_age: float = 0.0) 
                 stem = slugify(str(out.get("new_name", "")), stem)
                 used_ai = True
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
-                print("! Ollama not reachable, falling back to simple rules.", file=sys.stderr)
+                msg = "Ollama not reachable, falling back to simple rules."
+                if on_warn:
+                    on_warn(msg)
+                else:
+                    print("! " + msg, file=sys.stderr)
                 ai_alive = False
             except (KeyError, ValueError, TypeError):
                 pass  # bad model output for this file: keep rule-based result
@@ -209,6 +218,312 @@ def show(root: Path, moves: list[Move], applied: bool) -> None:
     print(f"\n{verb} {len(moves)} file(s)." + ("" if applied else "  Re-run with --apply to do it."))
 
 
+# -------------------------------------------------------------------- gui
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sloth-tidy</title>
+<style>
+:root{--bg:#f6f3ec;--card:#fffdf8;--ink:#2b2a26;--mute:#7a7568;--line:#e4dfd2;--accent:#52744a;--accent-ink:#fff;--warn:#a85a14;--chip:#ece7d8;--ai:#dfeadb}
+@media (prefers-color-scheme:dark){:root{--bg:#171815;--card:#20211d;--ink:#ece9df;--mute:#9a9686;--line:#33342d;--accent:#8fb37e;--accent-ink:#14150f;--warn:#e0a060;--chip:#2c2d26;--ai:#2a3a27}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 16px 80px}
+h1{font-size:1.9rem;margin:0}
+.tag{color:var(--mute);margin:2px 0 24px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+label.l{display:block;font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin-bottom:6px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input[type=text],select{flex:1;min-width:0;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);font:inherit}
+button{padding:10px 16px;border-radius:10px;border:1px solid var(--line);background:var(--chip);color:var(--ink);font:inherit;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.quick{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
+.quick button{padding:4px 10px;font-size:.85rem}
+.opts{margin-top:14px;display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end}
+.tog{display:flex;gap:8px;align-items:center;padding-bottom:10px;color:var(--mute);font-size:.9rem}
+.cat{margin-top:18px}
+.cat h3{margin:0 0 6px;font-size:1rem;display:flex;gap:8px;align-items:center}
+.cat h3 span{font-weight:400;color:var(--mute);font-size:.85rem}
+.item{display:flex;gap:10px;align-items:center;padding:7px 4px;border-top:1px solid var(--line);font-size:.95rem}
+.item .nm{flex:1;min-width:0;overflow-wrap:anywhere}
+.item .old{color:var(--mute);text-decoration:line-through;text-decoration-color:var(--line)}
+.item .arrow{color:var(--mute);margin:0 6px}
+.badge{font-size:.7rem;padding:2px 8px;border-radius:99px;background:var(--chip);color:var(--mute);flex:none}
+.badge.ai{background:var(--ai);color:var(--ink)}
+.bar{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
+.note{color:var(--warn);font-size:.9rem;margin-top:10px}
+.msg{padding:12px 16px;border-radius:10px;background:var(--ai);margin-bottom:16px}
+.msg.err{background:#f3d6cf;color:#5a1d10}
+@media (prefers-color-scheme:dark){.msg.err{background:#4a2219;color:#f3d6cf}}
+a{color:var(--accent)}
+.empty{color:var(--mute);text-align:center;padding:24px}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:s 1s linear infinite;vertical-align:-2px;margin-right:8px}
+@keyframes s{to{transform:rotate(360deg)}}
+dialog{border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--ink);width:min(560px,92vw);padding:18px}
+dialog::backdrop{background:rgba(0,0,0,.4)}
+.dirs{max-height:280px;overflow:auto;margin:10px 0;border:1px solid var(--line);border-radius:10px}
+.dirs div{padding:8px 12px;cursor:pointer;border-top:1px solid var(--line)}
+.dirs div:first-child{border-top:0}
+.dirs div:hover{background:var(--chip)}
+.cur{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.85rem;overflow-wrap:anywhere;color:var(--mute)}
+</style></head>
+<body><main>
+<h1>sloth-tidy 🦥</h1>
+<p class="tag">Slow and steady. A local model tidies your folder; nothing leaves this machine.</p>
+
+<div id="msg" hidden></div>
+
+<div class="card">
+  <label class="l" for="folder">Folder to tidy</label>
+  <div class="row">
+    <input type="text" id="folder" placeholder="Paste a path, or press Browse" autocomplete="off">
+    <button id="browse">Browse…</button>
+  </div>
+  <div class="quick" id="quick"></div>
+  <div class="opts">
+    <div><label class="l" for="model">Model (from your Ollama)</label>
+      <select id="model"></select></div>
+    <label class="tog"><input type="checkbox" id="noai"> Skip the model (extension rules only)</label>
+  </div>
+  <div class="row" style="margin-top:16px">
+    <button class="primary" id="go">Take a look (nothing moves yet)</button>
+    <button id="undo">Undo last tidy</button>
+  </div>
+</div>
+
+<div class="card" id="result" hidden>
+  <div id="summary"></div>
+  <div id="plan"></div>
+  <div class="note" id="warn" hidden></div>
+  <div class="bar" id="actions" hidden>
+    <span><a href="#" id="all">all</a> / <a href="#" id="none">none</a> &nbsp; <span id="count"></span></span>
+    <button class="primary" id="apply">Move the selected files</button>
+  </div>
+</div>
+
+<dialog id="dlg">
+  <strong>Pick a folder</strong>
+  <div class="cur" id="cur"></div>
+  <div class="dirs" id="dirs"></div>
+  <div class="row" style="justify-content:flex-end">
+    <button id="cancel">Cancel</button>
+    <button id="up">Up one level</button>
+    <button class="primary" id="use">Use this folder</button>
+  </div>
+</dialog>
+</main>
+<script>
+const TOKEN="__TOKEN__", DEF=__DEFAULTS__;
+const $=s=>document.querySelector(s);
+let current=null, curDir="";
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+async function api(path,body){
+  const o={headers:{"X-Token":TOKEN}};
+  if(body){o.method="POST";o.headers["Content-Type"]="application/json";o.body=JSON.stringify(body)}
+  const r=await fetch(path,o);let j={};try{j=await r.json()}catch(e){}
+  if(!r.ok)throw new Error(j.error||r.statusText);return j;
+}
+function say(text,err){const m=$("#msg");m.className="msg"+(err?" err":"");m.textContent=text;m.hidden=!text}
+function busy(on,label){["go","undo","apply","browse"].forEach(i=>{const b=$("#"+i);if(b)b.disabled=on});
+  if(on){const m=$("#msg");m.className="msg";m.replaceChildren(el("span","spin"),document.createTextNode(label));m.hidden=false}}
+async function loadModels(){
+  const sel=$("#model");sel.replaceChildren();
+  try{const j=await api("/api/models?host="+encodeURIComponent(DEF.host));
+    j.models.forEach(n=>{const o=el("option","",n);o.value=n;sel.append(o)});
+    if(j.models.includes(DEF.model))sel.value=DEF.model;
+    if(!j.models.length)throw new Error("none")}
+  catch(e){const o=el("option","",DEF.model+" (Ollama not detected)");o.value=DEF.model;sel.append(o)}
+}
+async function ls(path){
+  const j=await api("/api/ls?path="+encodeURIComponent(path||""));
+  curDir=j.path;$("#cur").textContent=j.path;$("#up").disabled=!j.parent;$("#up").dataset.p=j.parent||"";
+  const d=$("#dirs");d.replaceChildren();
+  if(!j.dirs.length)d.append(el("div","","(no sub-folders)"));
+  j.dirs.forEach(n=>{const x=el("div","","📁 "+n);x.onclick=()=>ls(j.path+j.sep+n);d.append(x)});
+  return j;
+}
+$("#browse").onclick=async()=>{await ls($("#folder").value.trim());$("#dlg").showModal()};
+$("#cancel").onclick=()=>$("#dlg").close();
+$("#up").onclick=()=>ls($("#up").dataset.p);
+$("#use").onclick=()=>{$("#folder").value=curDir;$("#dlg").close()};
+function updateCount(){const n=document.querySelectorAll(".item input:checked").length;$("#count").textContent=n+" selected";$("#apply").disabled=!n}
+function render(p){
+  $("#result").hidden=false;const box=$("#plan");box.replaceChildren();
+  $("#warn").hidden=!p.warnings.length;$("#warn").textContent=p.warnings.join(" ");
+  if(!p.moves.length){$("#summary").textContent="";box.append(el("div","empty","Already tidy. Nothing to do. The sloth approves."));$("#actions").hidden=true;return}
+  const ai=p.moves.filter(m=>m.used_ai).length;
+  $("#summary").textContent=p.moves.length+" file(s) would move. "+ai+" decided by the model, "+(p.moves.length-ai)+" by simple rules.";
+  const groups={};p.moves.forEach(m=>(groups[m.category]=groups[m.category]||[]).push(m));
+  Object.keys(groups).sort().forEach(c=>{
+    const g=el("div","cat"),h=el("h3","",c);h.append(el("span","",groups[c].length+" file(s)"));g.append(h);
+    groups[c].forEach(m=>{
+      const row=el("label","item"),cb=el("input");cb.type="checkbox";cb.checked=true;cb.onchange=updateCount;
+      cb._m={name:m.name,category:m.category,new_name:m.new_name};
+      const nm=el("span","nm");nm.append(el("span","old",m.name),el("span","arrow","→"),el("strong","",m.new_name));
+      row.append(cb,nm,el("span","badge"+(m.used_ai?" ai":""),m.used_ai?"AI":"rule"));g.append(row)});
+    box.append(g)});
+  $("#actions").hidden=false;updateCount();
+}
+$("#go").onclick=async()=>{
+  const folder=$("#folder").value.trim();if(!folder){say("Pick a folder first.",true);return}
+  busy(true,"The sloth is reading your files. Slow and steady, this can take a while…");
+  try{current=await api("/api/plan",{folder,model:$("#model").value,host:DEF.host,no_ai:$("#noai").checked});
+    say("");render(current)}catch(e){say(e.message,true);$("#result").hidden=true}
+  busy(false);if($("#msg").textContent.trim()===""||$("#msg").querySelector(".spin"))say("")
+};
+$("#apply").onclick=async()=>{
+  const moves=[...document.querySelectorAll(".item input:checked")].map(c=>c._m);
+  busy(true,"Moving files…");
+  try{const j=await api("/api/apply",{folder:$("#folder").value.trim(),moves});
+    $("#result").hidden=true;say("Moved "+j.moved+" file(s). Changed your mind? Press “Undo last tidy”.")}
+  catch(e){say(e.message,true)}busy(false)
+};
+$("#undo").onclick=async()=>{
+  if(!$("#folder").value.trim()){say("Pick a folder first.",true);return}
+  busy(true,"Putting things back…");
+  try{const j=await api("/api/undo",{folder:$("#folder").value.trim()});
+    $("#result").hidden=true;say(j.restored?"Restored "+j.restored+" file(s).":"Nothing to undo in this folder.")}
+  catch(e){say(e.message,true)}busy(false)
+};
+$("#all").onclick=e=>{e.preventDefault();document.querySelectorAll(".item input").forEach(c=>c.checked=true);updateCount()};
+$("#none").onclick=e=>{e.preventDefault();document.querySelectorAll(".item input").forEach(c=>c.checked=false);updateCount()};
+$("#noai").checked=DEF.no_ai;
+(async()=>{
+  await loadModels();
+  const j=await api("/api/ls?path=");
+  const q=$("#quick");
+  j.quick.forEach(f=>{const b=el("button","",f.label);b.onclick=()=>{$("#folder").value=f.path};q.append(b)});
+})();
+</script></body></html>
+"""
+
+
+def _safe_root(raw: str) -> Path:
+    root = Path(raw).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"Not a folder: {root}")
+    if root == Path(root.anchor):
+        raise ValueError("Refusing to tidy a filesystem root.")
+    return root
+
+
+def make_gui_server(port: int, host: str, model: str, use_ai: bool):
+    """Build the local web UI server. Returns (server, token)."""
+    token = secrets.token_urlsafe(16)
+    defaults = {"host": host, "model": model, "no_ai": not use_ai}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code: int, payload, ctype="application/json"):
+            data = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _guard(self, api: bool) -> bool:
+            # Only answer requests addressed to loopback (defeats DNS rebinding)
+            # and, for the API, only callers that hold this session's token.
+            if self.headers.get("Host", "").rsplit(":", 1)[0] not in ("127.0.0.1", "localhost"):
+                self._send(403, {"error": "forbidden host"})
+                return False
+            if api and self.headers.get("X-Token") != token:
+                self._send(403, {"error": "bad token"})
+                return False
+            return True
+
+        def do_GET(self):
+            url = urllib.parse.urlparse(self.path)
+            if url.path == "/":
+                if self._guard(False):
+                    page = PAGE.replace("__TOKEN__", token).replace("__DEFAULTS__", json.dumps(defaults))
+                    self._send(200, page, "text/html")
+                return
+            if not self._guard(True):
+                return
+            q = urllib.parse.parse_qs(url.query)
+            try:
+                if url.path == "/api/models":
+                    h = (q.get("host") or [host])[0]
+                    try:
+                        with urllib.request.urlopen(h.rstrip("/") + "/api/tags", timeout=3) as r:
+                            names = [m["name"] for m in json.load(r).get("models", [])]
+                    except (OSError, ValueError, KeyError):
+                        names = []
+                    self._send(200, {"models": names})
+                elif url.path == "/api/ls":
+                    raw = (q.get("path") or [""])[0].strip()
+                    p = Path(raw).expanduser() if raw else Path.home()
+                    p = p.resolve()
+                    if not p.is_dir():
+                        p = Path.home()
+                    dirs = []
+                    try:
+                        dirs = sorted(c.name for c in p.iterdir() if c.is_dir() and not c.name.startswith("."))
+                    except OSError:
+                        pass
+                    quick = [{"label": n, "path": str(Path.home() / n)}
+                             for n in ("Downloads", "Desktop", "Documents") if (Path.home() / n).is_dir()]
+                    parent = str(p.parent) if p.parent != p else ""
+                    sep = "" if str(p).endswith(("/", "\\")) else ("\\" if "\\" in str(p) else "/")
+                    self._send(200, {"path": str(p), "parent": parent, "dirs": dirs, "sep": sep, "quick": quick})
+                else:
+                    self._send(404, {"error": "not found"})
+            except Exception as e:  # noqa: BLE001
+                self._send(400, {"error": str(e)})
+
+        def do_POST(self):
+            if not self._guard(True):
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
+                root = _safe_root(str(body.get("folder", "")))
+                if self.path == "/api/plan":
+                    warnings: list[str] = []
+                    moves = plan(root, str(body.get("host") or host), str(body.get("model") or model),
+                                 not body.get("no_ai"), on_warn=warnings.append)
+                    self._send(200, {
+                        "warnings": warnings,
+                        "moves": [{"name": m.src.name, "category": m.category,
+                                   "new_name": m.dst.name, "used_ai": m.used_ai} for m in moves],
+                    })
+                elif self.path == "/api/apply":
+                    taken: set[Path] = set()
+                    todo: list[Move] = []
+                    for item in body.get("moves", []):
+                        name, cat = str(item.get("name", "")), str(item.get("category", ""))
+                        src = root / name
+                        if Path(name).name != name or name.startswith(".") or not src.is_file():
+                            raise ValueError(f"Skipping unknown file: {name}")
+                        if cat not in CATEGORIES:
+                            raise ValueError(f"Unknown category: {cat}")
+                        stem = slugify(Path(str(item.get("new_name", ""))).stem, slugify(src.stem, "file"))
+                        dst = unique(root / cat / f"{stem}{src.suffix.lower()}", taken)
+                        taken.add(dst)
+                        todo.append(Move(src, dst, cat, False))
+                    if todo:
+                        apply(root, todo)
+                    self._send(200, {"moved": len(todo)})
+                elif self.path == "/api/undo":
+                    self._send(200, {"restored": undo(root)})
+                else:
+                    self._send(404, {"error": "not found"})
+            except ValueError as e:
+                self._send(400, {"error": str(e)})
+            except Exception as e:  # noqa: BLE001
+                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    return httpd, token
+
+
 # -------------------------------------------------------------------- cli
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sloth-tidy", description=__doc__.splitlines()[0])
@@ -221,12 +536,26 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--apply", action="store_true", help="actually move files (default: dry run)")
     u = sub.add_parser("undo", help="revert the most recent tidy-up")
     u.add_argument("folder", type=Path)
+    g = sub.add_parser("gui", help="open the graphical interface in your browser")
+    g.add_argument("--port", type=int, default=8765)
+    g.add_argument("--no-browser", action="store_true", help="don't open a browser tab automatically")
     w = sub.add_parser("watch", help="tidy a folder forever, slowly")
     w.add_argument("folder", type=Path)
     w.add_argument("--every", type=float, default=300.0, help="seconds between naps")
     w.add_argument("--settle", type=float, default=10.0, help="ignore files newer than this many seconds")
     args = p.parse_args(argv)
 
+    if args.cmd == "gui":
+        httpd, _ = make_gui_server(args.port, args.host, args.model, not args.no_ai)
+        url = f"http://127.0.0.1:{httpd.server_port}/"
+        print(f"sloth-tidy GUI running at {url}  (Ctrl+C to stop)")
+        if not args.no_browser:
+            threading.Timer(0.5, webbrowser.open, args=(url,)).start()
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nBack to sleep.")
+        return 0
     root = args.folder.expanduser().resolve()
     if not root.is_dir():
         print(f"Not a folder: {root}", file=sys.stderr)

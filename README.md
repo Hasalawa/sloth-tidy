@@ -10,6 +10,22 @@ machine.
 Built for the DEV Hacktoberfest Open-Source AI Challenge, Week 3: *Slow and Steady*.
 Started and finished inside the challenge window (Oct 19 to Oct 25, 2026).
 
+```mermaid
+flowchart LR
+    A[📁 Messy folder] --> B[🔎 Read top-level files]
+    B --> C{🤖 Ollama available?}
+    C -->|Yes| D[🧠 Classify and rename]
+    C -->|No| E[🧩 Extension rules]
+    D --> F[✅ Validate and sanitise]
+    E --> F
+    F --> G[👀 Show dry-run plan]
+    G --> H{Apply?}
+    H -->|No| I[🛑 Leave files unchanged]
+    H -->|Yes| J[📦 Move without overwriting]
+    J --> K[📝 Write undo log]
+    K --> L[↩️ Undo latest run]
+```
+
 ## Quick start
 
 ```bash
@@ -19,9 +35,16 @@ python3 sloth_tidy.py tidy ./messy            # dry run: shows the plan only
 python3 sloth_tidy.py tidy ./messy --apply    # do it
 python3 sloth_tidy.py undo ./messy            # changed your mind? put it all back
 python3 sloth_tidy.py watch ~/Downloads --every 600   # tidy forever, slowly
+python3 sloth_tidy.py gui                     # prefer clicking? opens a local web UI
 ```
 
 No dependencies beyond Python 3.9+ and a running Ollama.
+
+## Graphical interface
+
+`python3 sloth_tidy.py gui` starts a small web UI on `http://127.0.0.1:8765` and opens it in your browser. Pick a folder (paste a path or browse), pick any model you have pulled in Ollama, press **Take a look** to see the plan grouped by category, untick anything you disagree with, then **Move the selected files**. **Undo last tidy** reverses it.
+
+It is still 100% local and still standard library only. The server listens on loopback only, rejects requests for other host names, and the API needs a per-session token, so a random web page in your browser cannot drive it. The server re-validates every move it is asked to make (file must exist directly in the folder, category must be on the list, names are re-slugified).
 
 ## Options
 
@@ -30,6 +53,8 @@ No dependencies beyond Python 3.9+ and a running Ollama.
 | `--model NAME` | Any Ollama model you have pulled (default `llama3.2:3b`) |
 | `--host URL` | Ollama address (default `http://localhost:11434`) |
 | `--no-ai` | Skip the model, use extension rules only |
+| `--port N` | `gui` only: port for the web UI (default 8765) |
+| `--no-browser` | `gui` only: don't open a browser tab automatically |
 | `--apply` | Actually move files (default is a dry run) |
 | `--every N` / `--settle N` | `watch` only: nap length, and ignore files newer than N seconds |
 
@@ -66,8 +91,6 @@ Swap the model, edit the category list or the prompt at the top of `sloth_tidy.p
 ```bash
 git tag v1.0.0 && git push origin v1.0.0
 ```
-
-Replace `YOUR-USER` in the badge above with your GitHub username.
 
 ## License
 

@@ -2,6 +2,8 @@ import json
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -112,6 +114,95 @@ class Tests(unittest.TestCase):
         st.undo(self.root)
         self.assertTrue((self.root / "b.zip").exists())
         self.assertTrue((self.root / "Documents" / "a.txt").exists())
+
+
+class GuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fake = HTTPServer(("127.0.0.1", 0), FakeOllama)
+        threading.Thread(target=cls.fake.serve_forever, daemon=True).start()
+        cls.ollama = f"http://127.0.0.1:{cls.fake.server_port}"
+        cls.gui, cls.token = st.make_gui_server(0, cls.ollama, "m", True)
+        threading.Thread(target=cls.gui.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.gui.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gui.shutdown()
+        cls.fake.shutdown()
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.root = Path(self._t.name)
+        REPLY.clear()
+
+    def tearDown(self):
+        self._t.cleanup()
+
+    def call(self, path, body=None, token=True, host=None):
+        req = urllib.request.Request(self.base + path, data=None if body is None else json.dumps(body).encode())
+        if token:
+            req.add_header("X-Token", self.token)
+        if host:
+            req.add_header("Host", host)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    def test_page_served_with_token(self):
+        with urllib.request.urlopen(self.base + "/") as r:
+            html = r.read().decode()
+        self.assertIn(self.token, html)
+        self.assertNotIn("__TOKEN__", html)
+        self.assertNotIn("__DEFAULTS__", html)
+
+    def test_api_requires_token_and_loopback_host(self):
+        self.assertEqual(self.call("/api/ls?path=", token=False)[0], 403)
+        self.assertEqual(self.call("/api/ls?path=", host="evil.example.com")[0], 403)
+
+    def test_plan_apply_undo_over_http(self):
+        (self.root / "scan.txt").write_text("Electricity bill")
+        (self.root / "keep.zip").write_bytes(b"x")
+        REPLY["scan.txt"] = {"category": "Receipts", "new_name": "Electricity Bill"}
+        code, plan = self.call("/api/plan", {"folder": str(self.root), "model": "m", "host": self.ollama})
+        self.assertEqual(code, 200)
+        by_name = {m["name"]: m for m in plan["moves"]}
+        self.assertEqual(by_name["scan.txt"]["new_name"], "electricity-bill.txt")
+        self.assertTrue(by_name["scan.txt"]["used_ai"])
+        self.assertTrue((self.root / "scan.txt").exists())  # planning moved nothing
+        # user unticks keep.zip: only scan.txt is applied
+        code, res = self.call("/api/apply", {"folder": str(self.root), "moves": [by_name["scan.txt"]]})
+        self.assertEqual((code, res["moved"]), (200, 1))
+        self.assertTrue((self.root / "Receipts" / "electricity-bill.txt").exists())
+        self.assertTrue((self.root / "keep.zip").exists())
+        code, res = self.call("/api/undo", {"folder": str(self.root)})
+        self.assertEqual(res["restored"], 1)
+        self.assertTrue((self.root / "scan.txt").exists())
+
+    def test_apply_rejects_tampered_requests(self):
+        (self.root / "a.txt").write_text("x")
+        bad = [
+            {"name": "../a.txt", "category": "Documents", "new_name": "a.txt"},
+            {"name": "a.txt", "category": "../../tmp", "new_name": "a.txt"},
+            {"name": "ghost.txt", "category": "Documents", "new_name": "a.txt"},
+        ]
+        for mv in bad:
+            code, _ = self.call("/api/apply", {"folder": str(self.root), "moves": [mv]})
+            self.assertEqual(code, 400, mv)
+        self.assertTrue((self.root / "a.txt").exists())
+
+    def test_refuses_non_folder_and_filesystem_root(self):
+        self.assertEqual(self.call("/api/plan", {"folder": "/definitely/not/here"})[0], 400)
+        self.assertEqual(self.call("/api/plan", {"folder": "/"})[0], 400)
+
+    def test_plan_reports_ollama_down_warning(self):
+        (self.root / "a.mp3").write_bytes(b"x")
+        code, plan = self.call("/api/plan", {"folder": str(self.root), "host": "http://127.0.0.1:9"})
+        self.assertEqual(code, 200)
+        self.assertTrue(plan["warnings"])
+        self.assertEqual(plan["moves"][0]["category"], "Audio")
 
 
 if __name__ == "__main__":
