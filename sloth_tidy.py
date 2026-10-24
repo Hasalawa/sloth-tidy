@@ -14,6 +14,7 @@ import argparse
 import json
 import re
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -70,10 +71,29 @@ class Move:
 
 
 # ---------------------------------------------------------------- helpers
+# Names Windows refuses to create as files, and files we must never touch:
+RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+SKIP_EXT = {".crdownload", ".part", ".partial", ".tmp", ".temp", ".download", ".opdownload", ".aria2"}
+SKIP_NAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
+
+
 def slugify(text: str, fallback: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     s = re.sub(r"-{2,}", "-", s)[:60].strip("-")
-    return s or fallback
+    s = s or fallback
+    return s + "-file" if s in RESERVED else s
+
+
+def is_ignored(f: Path) -> bool:
+    """Dotfiles, our own log, unfinished downloads, Office lock files, Windows hidden/system files."""
+    name = f.name.lower()
+    if name.startswith((".", "~$")) or name == LOG_NAME or name in SKIP_NAMES or f.suffix.lower() in SKIP_EXT:
+        return True
+    try:
+        attrs = getattr(f.stat(), "st_file_attributes", 0)   # only exists on Windows
+    except OSError:
+        return True
+    return bool(attrs & 0x2 or attrs & 0x4)                  # hidden or system
 
 
 def snippet(path: Path, limit: int = 600) -> str:
@@ -143,7 +163,7 @@ def plan(root: Path, host: str, model: str, use_ai: bool, min_age: float = 0.0, 
     ai_alive = use_ai
     now = time.time()
     for f in sorted(root.iterdir()):
-        if not f.is_file() or f.name.startswith(".") or f.name == LOG_NAME:
+        if not f.is_file() or is_ignored(f):
             continue
         if min_age and now - f.stat().st_mtime < min_age:
             continue  # still being written/downloaded
@@ -155,7 +175,11 @@ def plan(root: Path, host: str, model: str, use_ai: bool, min_age: float = 0.0, 
                     category = out["category"]
                 stem = slugify(str(out.get("new_name", "")), stem)
                 used_ai = True
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            except (socket.timeout, TimeoutError):
+                # one slow file (e.g. the model is still loading): use rules for this file only
+                if on_warn:
+                    on_warn(f"The model was too slow for {f.name}; used simple rules for it.")
+            except (urllib.error.URLError, ConnectionError, OSError):
                 msg = "Ollama not reachable, falling back to simple rules."
                 if on_warn:
                     on_warn(msg)
@@ -170,44 +194,72 @@ def plan(root: Path, host: str, model: str, use_ai: bool, min_age: float = 0.0, 
     return moves
 
 
-def apply(root: Path, moves: list[Move]) -> None:
-    done = []
+def _read_log(log_path: Path) -> list:
+    try:
+        return json.loads(log_path.read_text(encoding="utf-8")) if log_path.exists() else []
+    except (OSError, ValueError):
+        return []
+
+
+def apply(root: Path, moves: list[Move]):
+    """Move the files. Returns (moved, failed).
+
+    Failures (a file open in another program, a permissions error...) are
+    skipped, not fatal, and everything that did move is logged so Undo works."""
+    done: list[Move] = []
+    failed: list[tuple[str, str]] = []
     for m in moves:
-        m.dst.parent.mkdir(exist_ok=True)
-        m.src.rename(m.dst)
-        done.append({"from": str(m.src), "to": str(m.dst)})
-    log_path = root / LOG_NAME
-    history = json.loads(log_path.read_text()) if log_path.exists() else []
-    history.append({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "moves": done})
-    log_path.write_text(json.dumps(history, indent=2))
+        try:
+            m.dst.parent.mkdir(exist_ok=True)
+            m.src.rename(m.dst)
+            done.append(m)
+        except OSError as e:
+            failed.append((m.src.name, e.strerror or str(e)))
+    if done:
+        log_path = root / LOG_NAME
+        history = _read_log(log_path)
+        history.append({"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "moves": [{"from": str(m.src), "to": str(m.dst)} for m in done]})
+        log_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    return done, failed
 
 
 def undo(root: Path) -> int:
     log_path = root / LOG_NAME
-    if not log_path.exists():
-        print("Nothing to undo.")
-        return 0
-    history = json.loads(log_path.read_text())
+    history = _read_log(log_path)
     if not history:
         print("Nothing to undo.")
         return 0
     run = history.pop()
-    restored = 0
+    restored, kept = 0, []
     for mv in reversed(run["moves"]):
         src, dst = Path(mv["to"]), Path(mv["from"])
-        if src.exists() and not dst.exists():
+        if not src.exists():
+            continue                      # file was moved or deleted since: nothing to restore
+        if dst.exists():
+            kept.append(mv)               # something new is in the way: keep it in the log
+            continue
+        try:
             src.rename(dst)
-            restored += 1
-            try:
-                src.parent.rmdir()  # remove category folder if now empty
-            except OSError:
-                pass
-    log_path.write_text(json.dumps(history, indent=2))
-    print(f"Restored {restored} file(s).")
+        except OSError:
+            kept.append(mv)               # locked right now: keep it so Undo can be retried
+            continue
+        restored += 1
+        try:
+            src.parent.rmdir()            # remove the category folder if now empty
+        except OSError:
+            pass
+    if kept:
+        history.append({"at": run.get("at", ""), "moves": list(reversed(kept))})
+    log_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    msg = f"Restored {restored} file(s)."
+    if kept:
+        msg += f" {len(kept)} could not be restored (in use or name taken); run undo again later."
+    print(msg)
     return restored
 
 
-def show(root: Path, moves: list[Move], applied: bool) -> None:
+def show(root: Path, moves: list[Move], applied: bool, failed=()) -> None:
     if not moves:
         print("Already tidy. Nothing to do. (Sloth approves.)")
         return
@@ -216,6 +268,8 @@ def show(root: Path, moves: list[Move], applied: bool) -> None:
         print(f"[{tag}] {m.src.name}  ->  {m.dst.relative_to(root)}")
     verb = "Moved" if applied else "Would move"
     print(f"\n{verb} {len(moves)} file(s)." + ("" if applied else "  Re-run with --apply to do it."))
+    for name, why in failed:
+        print(f"! Skipped {name}: {why} (is it open in another program?)")
 
 
 # -------------------------------------------------------------------- gui
@@ -326,8 +380,12 @@ async function api(path,body){
   if(!r.ok)throw new Error(j.error||r.statusText);return j;
 }
 function say(text,err){const m=$("#msg");m.className="msg"+(err?" err":"");m.textContent=text;m.hidden=!text}
+let tick=null;
 function busy(on,label){["go","undo","apply","browse"].forEach(i=>{const b=$("#"+i);if(b)b.disabled=on});
-  if(on){const m=$("#msg");m.className="msg";m.replaceChildren(el("span","spin"),document.createTextNode(label));m.hidden=false}}
+  clearInterval(tick);
+  if(on){const m=$("#msg");m.className="msg";const t=document.createTextNode(label),t0=Date.now();
+    m.replaceChildren(el("span","spin"),t);m.hidden=false;
+    tick=setInterval(()=>{t.textContent=label+" ("+Math.round((Date.now()-t0)/1000)+" s)"},1000)}}
 async function loadModels(){
   const sel=$("#model");sel.replaceChildren();
   try{const j=await api("/api/models?host="+encodeURIComponent(DEF.host));
@@ -377,7 +435,10 @@ $("#apply").onclick=async()=>{
   const moves=[...document.querySelectorAll(".item input:checked")].map(c=>c._m);
   busy(true,"Moving files…");
   try{const j=await api("/api/apply",{folder:$("#folder").value.trim(),moves});
-    $("#result").hidden=true;say("Moved "+j.moved+" file(s). Changed your mind? Press “Undo last tidy”.")}
+    $("#result").hidden=true;
+    let t="Moved "+j.moved+" file(s). Changed your mind? Press “Undo last tidy”.";
+    if(j.failed&&j.failed.length)t+=" Skipped "+j.failed.length+" (probably open in another program): "+j.failed.map(f=>f.name).join(", ");
+    say(t,j.failed&&j.failed.length>0)}
   catch(e){say(e.message,true)}busy(false)
 };
 $("#undo").onclick=async()=>{
@@ -508,9 +569,8 @@ def make_gui_server(port: int, host: str, model: str, use_ai: bool):
                         dst = unique(root / cat / f"{stem}{src.suffix.lower()}", taken)
                         taken.add(dst)
                         todo.append(Move(src, dst, cat, False))
-                    if todo:
-                        apply(root, todo)
-                    self._send(200, {"moved": len(todo)})
+                    ok, failed = apply(root, todo) if todo else ([], [])
+                    self._send(200, {"moved": len(ok), "failed": [{"name": n, "error": e} for n, e in failed]})
                 elif self.path == "/api/undo":
                     self._send(200, {"restored": undo(root)})
                 else:
@@ -565,18 +625,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "tidy":
         moves = plan(root, args.host, args.model, not args.no_ai)
+        failed: list = []
         if args.apply and moves:
-            apply(root, moves)
-        show(root, moves, args.apply)
+            moves, failed = apply(root, moves)
+        show(root, moves, args.apply, failed)
         return 0
     # watch
     print(f"Napping on {root}. Ctrl+C to wake me.")
     try:
         while True:
-            moves = plan(root, args.host, args.model, not args.no_ai, min_age=args.settle)
-            if moves:
-                apply(root, moves)
-                show(root, moves, True)
+            try:
+                moves = plan(root, args.host, args.model, not args.no_ai, min_age=args.settle)
+                if moves:
+                    moves, failed = apply(root, moves)
+                    show(root, moves, True, failed)
+            except Exception as e:  # noqa: BLE001  (a nap must never be fatal)
+                print(f"! {type(e).__name__}: {e}. Trying again next time.", file=sys.stderr)
             time.sleep(args.every)
     except KeyboardInterrupt:
         print("\nBack to sleep.")

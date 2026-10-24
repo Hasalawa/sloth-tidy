@@ -34,7 +34,7 @@
 
 | | |
 |---|---|
-| 🧠 **Understands files** | `scan0003.txt` is a text file to a rule engine. A model reads it and knows it's an electricity bill. |
+| 🧠 **Reads, not just sorts** | A rule engine only sees the extension. The model also sees the file's name and, for text files, its first lines, so an invoice can land in `Receipts/` with a readable name. |
 | 🔒 **Private by construction** | Files are read by a model on your own machine. No API key, no upload, works offline. |
 | 👀 **Look before it moves** | Dry run by default. You get a plan grouped by category and can untick anything. |
 | ↩️ **Undo button** | Every run is logged. One click puts every file back where it was. |

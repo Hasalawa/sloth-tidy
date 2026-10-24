@@ -1,7 +1,9 @@
 import json
 import tempfile
 import threading
+import socket
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -115,6 +117,61 @@ class Tests(unittest.TestCase):
         self.assertTrue((self.root / "b.zip").exists())
         self.assertTrue((self.root / "Documents" / "a.txt").exists())
 
+    # ---- robustness (things that go wrong on a real Windows Downloads folder)
+    def test_locked_file_is_skipped_and_everything_else_stays_undoable(self):
+        for n in ("a.txt", "b.txt", "c.txt"):
+            (self.root / n).write_text(n)
+        moves = st.plan(self.root, "", "", False)
+        real = Path.rename
+        def flaky(self_, target):
+            if self_.name == "b.txt":
+                raise PermissionError(13, "The process cannot access the file")
+            return real(self_, target)
+        with mock.patch.object(Path, "rename", flaky):
+            moved, failed = st.apply(self.root, moves)
+        self.assertEqual(sorted(m.src.name for m in moved), ["a.txt", "c.txt"])
+        self.assertEqual([f[0] for f in failed], ["b.txt"])
+        self.assertTrue((self.root / "b.txt").exists())
+        self.assertEqual(st.undo(self.root), 2)           # the log was written despite the failure
+        self.assertTrue((self.root / "a.txt").exists() and (self.root / "c.txt").exists())
+
+    def test_unfinished_downloads_and_system_files_are_left_alone(self):
+        for n in ("movie.mp4.crdownload", "x.part", "desktop.ini", "Thumbs.db", "~$report.docx", "real.pdf"):
+            (self.root / n).write_text("x")
+        names = [m.src.name for m in st.plan(self.root, "", "", False)]
+        self.assertEqual(names, ["real.pdf"])
+
+    def test_windows_reserved_names_are_avoided(self):
+        self.assertEqual(st.slugify("NUL", "file"), "nul-file")
+        self.assertEqual(st.slugify("com1", "file"), "com1-file")
+        self.assertEqual(st.slugify("console", "file"), "console")
+
+    def test_undo_keeps_entries_it_could_not_restore(self):
+        (self.root / "a.txt").write_text("1")
+        st.apply(self.root, st.plan(self.root, "", "", False))
+        (self.root / "a.txt").write_text("someone made a new a.txt")   # the original spot is taken
+        self.assertEqual(st.undo(self.root), 0)
+        (self.root / "a.txt").unlink()
+        self.assertEqual(st.undo(self.root), 1)                         # still possible afterwards
+        self.assertEqual((self.root / "a.txt").read_text(), "1")
+
+    def test_one_slow_file_does_not_switch_the_model_off(self):
+        (self.root / "a.txt").write_text("1"); (self.root / "b.txt").write_text("2")
+        calls = []
+        def fake(path, host, model, timeout=0):
+            calls.append(path.name)
+            if path.name == "a.txt":
+                raise socket.timeout("slow")
+            return {"category": "Documents", "new_name": "bee"}
+        warns = []
+        with mock.patch.object(st, "ask_ollama", fake):
+            moves = st.plan(self.root, "h", "m", True, on_warn=warns.append)
+        by = {m.src.name: m for m in moves}
+        self.assertFalse(by["a.txt"].used_ai)
+        self.assertTrue(by["b.txt"].used_ai)
+        self.assertEqual(calls, ["a.txt", "b.txt"])
+        self.assertTrue(warns and "a.txt" in warns[0])
+
 
 class GuiTests(unittest.TestCase):
     @classmethod
@@ -203,6 +260,21 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(plan["warnings"])
         self.assertEqual(plan["moves"][0]["category"], "Audio")
+
+    def test_apply_reports_files_that_could_not_move(self):
+        (self.root / "a.txt").write_text("1"); (self.root / "b.txt").write_text("2")
+        moves = [{"name": "a.txt", "category": "Documents", "new_name": "a.txt"},
+                 {"name": "b.txt", "category": "Documents", "new_name": "b.txt"}]
+        real = Path.rename
+        def flaky(self_, target):
+            if self_.name == "b.txt":
+                raise PermissionError(13, "in use")
+            return real(self_, target)
+        with mock.patch.object(Path, "rename", flaky):
+            code, res = self.call("/api/apply", {"folder": str(self.root), "moves": moves})
+        self.assertEqual(code, 200)
+        self.assertEqual(res["moved"], 1)
+        self.assertEqual(res["failed"][0]["name"], "b.txt")
 
 
 if __name__ == "__main__":
